@@ -1,0 +1,9 @@
+scrcpy 3.3.3 <https://github.com/Genymobile/scrcpy>
+INFO: ADB device found:
+INFO:     -->   (usb)  32dafaf4                        device  RMX3521
+C:\Users\ankit\Downloads\Compressed\PhoneMirror-ScrcpyGUI-camera-fixed-v2\PhoneMirror-ScrcpyGUI\scrcpy-server: 1 file pushed, 0 skipped. 139.7 MB/s (90164 bytes in 0.001s)
+[server] INFO: Device: [realme] realme RMX3521 (Android 14)
+ERROR: Could not open icon image: C:\Users\ankit\Downloads\Compressed\PhoneMirror-ScrcpyGUI-camera-fixed-v2\PhoneMirror-ScrcpyGUI\icon.png
+WARN: Could not load icon
+INFO: Renderer: direct3d
+INFO: Texture: 864x1920
