@@ -1,4 +1,4 @@
-# PhoneMirror V5 — Fresh Build
+# PhoneMirror V5 - Fresh Build
 
 This UI is a new implementation written for this project. It does not reuse the previous GUI source.
 
@@ -20,7 +20,6 @@ This source build requires Python 3. `adb.exe` and `scrcpy.exe` are bundled when
 ## Important
 The UI and application logic are newly written. The scrcpy/ADB binaries are runtime dependencies, not the UI source.
 #   P h o n e M i r r o r - S c r c p y G U I 
- 
- #   P h o n e M i r r o r - S c r c p y G U I 
+
  
  
