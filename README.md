@@ -1,4 +1,4 @@
-# PhoneMirror V5 - Fresh Build
+# PhoneMirror V1 - Fresh Build
 
 This UI is a new implementation written for this project. It does not reuse the previous GUI source.
 
