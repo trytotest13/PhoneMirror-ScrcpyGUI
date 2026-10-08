@@ -1,4 +1,4 @@
-# PhoneMirror — Scrcpy GUI
+# PhoneMirror - Scrcpy GUI
 
 A simple Windows GUI for mirroring and controlling Android devices with scrcpy.
 
@@ -14,18 +14,18 @@ A simple Windows GUI for mirroring and controlling Android devices with scrcpy.
 ### Quick-Action Toggles
 The QUICK ACTIONS panel includes two toggle buttons. Enabled toggles are highlighted green.
 
-- **🎤 Mic** — Turn microphone audio capture on/off independently:
+- **🎤 Mic** - Turn microphone audio capture on/off independently:
   - ON: the microphone is used as the audio source (`--audio-source mic`)
   - OFF: all audio is disabled (`--no-audio`)
   - scrcpy cannot change its audio source while running, so toggling Mic automatically
     restarts an active mirroring session with the new setting.
-- **📌 On Top** — Overlay mode: pin the scrcpy window above all other windows:
+- **📌 On Top** - Overlay mode: pin the scrcpy window above all other windows:
   - While mirroring is running, the running window is pinned/unpinned immediately
     (no restart needed)
   - Otherwise the setting is remembered and applied as `--always-on-top` on the next start
 
 ### Advanced Settings (Expert)
-Tabs for Video, Audio, Window, Device, Recording, and Performance — including codecs,
+Tabs for Video, Audio, Window, Device, Recording, and Performance - including codecs,
 bitrate, resolution, orientation, display ID, view-only mode, custom scrcpy arguments,
 and a recording folder/format selector that actually produces video files.
 
