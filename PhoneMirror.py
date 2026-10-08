@@ -73,6 +73,9 @@ class PhoneMirror(tk.Tk):
         self.rotation_state = 0           # tracks user_rotation so Rotate actually cycles
         self.device_var = tk.StringVar(value="")   # selected device, drives a picker when >1 found
         self.advanced_widgets = {}        # name -> widget, so _scrcpy_args can read live values
+        self.mic_enabled = tk.BooleanVar(value=True)    # separate Mic on/off toggle
+        self.always_on_top = tk.BooleanVar(value=False) # overlay/on-top toggle
+        self.toggle_buttons = {}          # quick-action toggle buttons, for state colouring
         self._monitor_job = None
         self._pending_fullscreen = False
 
@@ -247,6 +250,8 @@ class PhoneMirror(tk.Tk):
             ("⟳", "Rotate", self.rotate, PURPLE),
             ("☀", "Stay Awake", self.toggle_stay_awake, ORANGE),
             ("▰", "Open Folder", self.open_recordings, CYAN),
+            ("🎤", "Mic", self.toggle_mic, ORANGE),
+            ("📌", "On Top", self.toggle_always_on_top, BLUE),
         ]
         for i, (icon, name, cmd, color) in enumerate(actions):
             b = tk.Button(qa, text=f"{icon}\n{name}", command=cmd,
@@ -256,6 +261,8 @@ class PhoneMirror(tk.Tk):
                           padx=5, pady=10)
             b.grid(row=i//3, column=i%3, sticky="nsew", padx=4, pady=4)
             qa.grid_columnconfigure(i%3, weight=1)
+            self.toggle_buttons[name] = b
+        self._refresh_toggle_buttons()
 
         # Emergency kill switch
         em = tk.Frame(self.left, bg=CARD, highlightthickness=1,
@@ -834,6 +841,24 @@ class PhoneMirror(tk.Tk):
             if not self.keep_screen_on.get():
                 pass
 
+        # Separate Mic toggle (quick action). Applied last so it overrides
+        # any audio decisions made above: OFF forces silence, ON forces the
+        # microphone as the audio source.
+        if not self.mic_enabled.get():
+            args = self._strip_arg(args, "--audio-source")
+            if "--no-audio" not in args:
+                args += ["--no-audio"]
+        else:
+            if "--no-audio" in args:
+                args.remove("--no-audio")
+            if not any(a == "--audio-source" or a.startswith("--audio-source=")
+                       for a in args):
+                args += ["--audio-source", "mic"]
+
+        # Always-on-top quick toggle. Skip if the Advanced tab already set it.
+        if self.always_on_top.get() and "--always-on-top" not in args:
+            args += ["--always-on-top"]
+
         if self.record_next_launch:
             fmt = self._adv("record_format", "MP4").lower()
             os.makedirs(self.record_path.get(), exist_ok=True)
@@ -1084,6 +1109,64 @@ class PhoneMirror(tk.Tk):
     def toggle_stay_awake(self):
         self.stay_awake.set(not self.stay_awake.get())
         self.set_status("Stay Awake " + ("enabled" if self.stay_awake.get() else "disabled"))
+
+    # ---------- mic / always-on-top quick toggles ----------
+    def _refresh_toggle_buttons(self):
+        # Colour the toggle quick-actions green while they are enabled so the
+        # state is visible at a glance (Mic starts ON, On Top starts OFF).
+        states = {"Mic": self.mic_enabled.get(), "On Top": self.always_on_top.get()}
+        for name, on in states.items():
+            b = self.toggle_buttons.get(name)
+            if b is not None:
+                b.config(bg="#164C36" if on else CARD_2)
+
+    @staticmethod
+    def _strip_arg(args, flag):
+        """Remove a flag from args in either '--flag value' or '--flag=value' form."""
+        while flag in args:
+            i = args.index(flag)
+            del args[i:i+2]  # flag plus its value (audio-source always has one here)
+        return [a for a in args if not a.startswith(flag + "=")]
+
+    def toggle_mic(self):
+        """Turn the microphone audio capture on/off independently.
+
+        scrcpy cannot switch its audio source while running, so if a session
+        is live we restart it with the new setting.
+        """
+        self.mic_enabled.set(not self.mic_enabled.get())
+        self._refresh_toggle_buttons()
+        on = self.mic_enabled.get()
+        self.set_status("Microphone " + ("ON — mic audio captured" if on
+                                         else "OFF — audio disabled"))
+        if self.scrcpy_proc is not None and self.scrcpy_proc.poll() is None:
+            self.stop_mirroring()
+            self.after(250, self.start_mirroring)
+
+    def toggle_always_on_top(self):
+        """Pin the scrcpy window above all other windows (overlay mode)."""
+        self.always_on_top.set(not self.always_on_top.get())
+        self._refresh_toggle_buttons()
+        on = self.always_on_top.get()
+        if self.scrcpy_proc is not None and self.scrcpy_proc.poll() is None \
+                and self._apply_always_on_top_runtime():
+            self.set_status("Always on top " + ("enabled" if on else "disabled"))
+        else:
+            self.set_status("Always on top " + ("enabled" if on else "disabled")
+                            + " — applies on next start")
+
+    def _apply_always_on_top_runtime(self):
+        """Apply/unapply topmost on the running scrcpy window via Win32."""
+        hwnd = self._scrcpy_window_hwnd()
+        if not hwnd:
+            return False
+        user32 = ctypes.windll.user32
+        HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+        SWP_NOSIZE, SWP_NOMOVE = 0x0001, 0x0002
+        user32.SetWindowPos(hwnd,
+                            HWND_TOPMOST if self.always_on_top.get() else HWND_NOTOPMOST,
+                            0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE)
+        return True
 
     def open_recordings(self):
         os.makedirs(self.record_path.get(),exist_ok=True)
