@@ -10,7 +10,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 APP_NAME = "PhoneMirror"
-APP_VERSION = "5.0"
+APP_VERSION = "5.2"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 ADB = os.path.join(ROOT, "adb.exe")
 SCRCPY = os.path.join(ROOT, "scrcpy.exe")
@@ -77,6 +77,8 @@ class PhoneMirror(tk.Tk):
         self.always_on_top = tk.BooleanVar(value=False) # overlay/on-top toggle
         self.toggle_buttons = {}          # quick-action toggle buttons, for state colouring
         self._monitor_job = None
+        self._camera_wait_job = None      # pending restart waiting for camera release
+        self._camera_retry_count = 0      # auto-retries for CAMERA_IN_USE restarts
         self._pending_fullscreen = False
 
         self._configure_styles()
@@ -275,6 +277,12 @@ class PhoneMirror(tk.Tk):
                          fg="white", active="#B52A36",
                          font=("Segoe UI Semibold", 12)).pack(fill="x", pady=(7, 2))
         tk.Label(em, text="Stop processes started by PhoneMirror",
+                 bg=CARD, fg="#FFB4BB", font=("Segoe UI", 8)).pack()
+        self.pill_button(em, "☠  STOP ALL — scrcpy + ADB",
+                         self.kill_all, bg="#5A1620",
+                         fg="white", active="#7A1F2C",
+                         font=("Segoe UI Semibold", 10)).pack(fill="x", pady=(8, 2))
+        tk.Label(em, text="Force-ends EVERY scrcpy/ADB process and releases the phone's camera",
                  bg=CARD, fg="#FFB4BB", font=("Segoe UI", 8)).pack()
 
     def section_title(self, parent, text, color):
@@ -697,11 +705,32 @@ class PhoneMirror(tk.Tk):
         # A scrcpy process cannot change video-source/camera-facing after it
         # has started. Restart it automatically so the button actually takes
         # effect instead of requiring the user to stop/start manually.
+        # A scrcpy process cannot change video-source/camera-facing after it
+        # has started. Restart it automatically so the change takes effect;
+        # camera targets wait for Android to release the camera first
+        # (see _restart_mirroring).
         if self.scrcpy_proc is not None and self.scrcpy_proc.poll() is None:
-            self.stop_mirroring()
-            self.after(250, self.start_mirroring)
+            self._restart_mirroring(
+                wait_camera=value in ("Back Camera", "Front Camera"))
 
-    # ---------- quality / controls ----------
+    # ---------- camera-aware restart ----------
+    # A scrcpy process cannot change video-source/camera/audio-source while
+    # running, so source/mic changes stop it and relaunch. The catch: Android
+    # releases the camera asynchronously after the old scrcpy server dies,
+    # and a relaunch that races that handoff dies with
+    # "CAMERA_IN_USE (4): Camera '0' is already open". Camera restarts
+    # therefore get a longer settle delay, and if scrcpy still dies with the
+    # camera-busy error, start_mirroring retries instead of showing a giant
+    # stack-trace dialog.
+    def _restart_mirroring(self, wait_camera=False):
+        """Stop the running scrcpy session and relaunch with new settings."""
+        if not (self.scrcpy_proc is not None and self.scrcpy_proc.poll() is None):
+            return
+        self.stop_mirroring()
+        self.set_status("Restarting mirroring…")
+        self._camera_wait_job = self.after(
+            2000 if wait_camera else 300, self.start_mirroring)
+
     def set_quality(self,name):
         self.quality.set(name)
         for n in ("low","medium","high"):
@@ -908,6 +937,8 @@ class PhoneMirror(tk.Tk):
 
     def stop_mirroring(self):
         self._stop_process_monitor()
+        self._cancel_camera_wait()
+        self._camera_retry_count = 0
         pid = self.scrcpy_proc.pid if self.scrcpy_proc else None
         self._kill_process_tree(pid)
         self.owned_pids.discard(pid)
@@ -936,11 +967,106 @@ class PhoneMirror(tk.Tk):
                 pass
             self._monitor_job = None
 
+    def _reset_run_buttons_after_restart(self):
+        """Keep Start/Stop usable during an automatic retry window."""
+        self.start_btn.config(state="disabled", bg="#155C3A")
+        self.stop_btn.config(state="normal", bg="#6E2028", fg="#FFDDE0")
+
+    def _camera_retry_worker(self):
+        """Frees the camera on the device, then relaunches scrcpy.
+
+        Retrying alone often fails because a stale scrcpy server (an
+        app_process on the phone) survived the kill and is still holding
+        camera 0 — Android then refuses every new open with CAMERA_IN_USE.
+        Kill any such leftover server first, wait for the release, and only
+        then start the new session. Increasing waits: 2s, 4s, 6s.
+        """
+        device = self.selected_device
+        if device:
+            # Preferred: kill the stale scrcpy server by its cmdline.
+            try:
+                subprocess.run(
+                    [ADB, "-s", device, "shell",
+                     "pkill -f com.genymobile.scrcpy"],
+                    cwd=ROOT, capture_output=True, timeout=6,
+                    creationflags=win_flags())
+            except Exception:
+                pass
+            # Fallback for devices without pkill: find app_process PIDs
+            # (scrcpy's server is the only thing this setup launches that
+            # way) and kill them individually.
+            try:
+                r=subprocess.run(
+                    [ADB, "-s", device, "shell", "ps -A"],
+                    cwd=ROOT, capture_output=True, text=True, timeout=6,
+                    creationflags=win_flags())
+                for line in (r.stdout or "").splitlines():
+                    if "app_process" in line:
+                        pid = line.split()[0]
+                        if pid.isdigit():
+                            subprocess.run(
+                                [ADB, "-s", device, "shell", f"kill -9 {pid}"],
+                                cwd=ROOT, capture_output=True, timeout=6,
+                                creationflags=win_flags())
+            except Exception:
+                pass
+        time.sleep(2.0 * self._camera_retry_count)
+        self.after(0, self.start_mirroring)
+
+    def _scrcpy_died_camera_busy(self):
+        """Check the captured scrcpy log for the known camera-in-use failure."""
+        log_path = os.path.join(ROOT, "scrcpy-error.log")
+        try:
+            if os.path.exists(log_path):
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+                    return ("CAMERA_IN_USE" in text or "is already open" in text)
+        except Exception:
+            pass
+        return False
+
+    def _cancel_camera_wait(self):
+        if self._camera_wait_job is not None:
+            try:
+                self.after_cancel(self._camera_wait_job)
+            except Exception:
+                pass
+            self._camera_wait_job = None
+
     def _check_process_alive(self):
         if self.scrcpy_proc is not None and self.scrcpy_proc.poll() is not None:
             # Process exited on its own (window closed, device unplugged, crash).
             self.owned_pids.discard(self.scrcpy_proc.pid)
             self.scrcpy_proc=None
+
+            # If this launch died because Android hadn't released the camera
+            # yet, retry the start automatically a couple of times instead of
+            # throwing the raw stack trace at the user.
+            if self._scrcpy_died_camera_busy():
+                self._camera_retry_count += 1
+                if self._camera_retry_count <= 3:
+                    # Flush/close the log handle from the dead launch so the
+                    # next start can open (and truncate) it again — Windows
+                    # refuses to delete an open file.
+                    try:
+                        if getattr(self, "_scrcpy_log_file", None):
+                            self._scrcpy_log_file.flush()
+                            self._scrcpy_log_file.close()
+                            self._scrcpy_log_file = None
+                    except Exception:
+                        pass
+                    log_path = os.path.join(ROOT, "scrcpy-error.log")
+                    try:
+                        os.remove(log_path)
+                    except OSError:
+                        pass
+                    self._reset_run_buttons_after_restart()
+                    self.set_status(
+                        f"Camera busy — freeing camera and retrying… "
+                        f"(attempt {self._camera_retry_count}/3)")
+                    threading.Thread(target=self._camera_retry_worker,
+                                     daemon=True).start()
+                    return
             self.start_btn.config(state="normal",bg=GREEN)
             self.stop_btn.config(state="disabled",bg=CARD_2,fg=MUTED)
             self.main_status.config(text="STATUS:  Ready",fg=TEXT)
@@ -962,8 +1088,26 @@ class PhoneMirror(tk.Tk):
                 pass
             if error_text:
                 short = error_text[-1800:]
-                self.set_status("scrcpy stopped — see error message")
-                messagebox.showerror("scrcpy stopped", short)
+                if self._scrcpy_died_camera_busy():
+                    self.set_status("scrcpy stopped — camera busy on device")
+                    force = messagebox.askyesno(
+                        "Camera in use",
+                        "The phone's camera is still held by another app or a\n"
+                        "leftover mirror session, so mirroring could not start.\n\n"
+                        "PhoneMirror retried 3 times automatically (killing any\n"
+                        "leftover session on the phone first).\n\n"
+                        "Force-stop ALL scrcpy + ADB processes and retry now?\n\n"
+                        "Choose NO if another PhoneMirror window is open — two\n"
+                        "copies fight over the camera. Close the other window,\n"
+                        "then press START MIRRORING here.")
+                    if force:
+                        self.kill_all()
+                        self.set_status("Camera freed — restarting mirroring…")
+                        self.main_status.config(text="STATUS:  Restarting…", fg=TEXT)
+                        self._camera_wait_job = self.after(4000, self.start_mirroring)
+                else:
+                    self.set_status("scrcpy stopped — see error message")
+                    messagebox.showerror("scrcpy stopped", short)
             else:
                 self.set_status("Mirroring ended")
             self._monitor_job = None
@@ -1140,8 +1284,8 @@ class PhoneMirror(tk.Tk):
         self.set_status("Microphone " + ("ON — mic audio captured" if on
                                          else "OFF — audio disabled"))
         if self.scrcpy_proc is not None and self.scrcpy_proc.poll() is None:
-            self.stop_mirroring()
-            self.after(250, self.start_mirroring)
+            self._restart_mirroring(
+                wait_camera=not self.mic_enabled.get())
 
     def toggle_always_on_top(self):
         """Pin the scrcpy window above all other windows (overlay mode)."""
@@ -1234,6 +1378,68 @@ class PhoneMirror(tk.Tk):
         self.stat_details.config(text="Kill switch stopped PhoneMirror processes")
         self.set_status("Kill switch: stopped app processes")
 
+    def kill_all(self):
+        """Hard stop: end EVERY scrcpy.exe and drop the ADB connection.
+
+        Unlike kill_switch (which only touches processes this app started),
+        this also kills scrcpy windows from other sources and terminates the
+        ADB server — which disconnects the phone and releases the camera held
+        by any leftover on-device scrcpy server. Use when the camera is
+        stuck and normal retries cannot free it.
+        """
+        self._stop_process_monitor()
+        self._cancel_camera_wait()
+        self._camera_retry_count = 0
+
+        # 1. Our own session, if any.
+        if self.scrcpy_proc is not None:
+            pid = self.scrcpy_proc.pid
+            if self.scrcpy_proc.poll() is None:
+                self._kill_process_tree(pid, trusted=True)
+            self.owned_pids.discard(pid)
+            self.scrcpy_proc = None
+
+        # 2. Every scrcpy.exe on the system (including ones not started here).
+        try:
+            subprocess.run(
+                ["taskkill", "/IM", "scrcpy.exe", "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=win_flags(), timeout=8)
+        except Exception:
+            pass
+        self.owned_pids.clear()
+
+        # 3. Kill the ADB server: this disconnects the phone, so any
+        # device-side scrcpy server dies and the camera is released.
+        try:
+            subprocess.run(
+                [ADB, "kill-server"], cwd=ROOT, capture_output=True,
+                timeout=8, creationflags=win_flags())
+        except Exception:
+            pass
+
+        # Reset UI to a clean state.
+        self.start_btn.config(state="normal", bg=GREEN)
+        self.stop_btn.config(state="disabled", bg=CARD_2, fg=MUTED)
+        self.main_status.config(text="STATUS:  Ready", fg=TEXT)
+        self.stat_details.config(text="STOP ALL ended every scrcpy/ADB process")
+        self.set_status("STOP ALL: scrcpy + ADB ended — camera released")
+
+        # Bring ADB back up quietly so the app keeps working.
+        self.adb_started_by_app = False
+        threading.Thread(target=self._adb_restart_worker, daemon=True).start()
+
+    def _adb_restart_worker(self):
+        try:
+            time.sleep(1.0)
+            subprocess.run(
+                [ADB, "start-server"], cwd=ROOT, capture_output=True,
+                timeout=10, creationflags=win_flags())
+            self.adb_started_by_app = True
+            self.after(0, self.scan_devices)
+        except Exception:
+            pass
+
     # ---------- helpers ----------
     def set_status(self,text):
         self.status.set(text)
@@ -1251,6 +1457,32 @@ class PhoneMirror(tk.Tk):
         self.kill_switch()
         self.destroy()
 
+def _another_instance_running():
+    """True if another PhoneMirror instance already holds the single-instance
+    mutex. Two copies fighting over the phone's camera cause endless
+    CAMERA_IN_USE failures."""
+    if sys.platform != "win32":
+        return False
+    try:
+        ctypes.windll.kernel32.CreateMutexW(
+            None, False, "PhoneMirror_SingleInstance_Mutex")
+        return ctypes.windll.kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+    except Exception:
+        return False
+
 if __name__=="__main__":
+    if _another_instance_running():
+        _probe = tk.Tk()
+        _probe.withdraw()
+        _ok = messagebox.askyesno(
+            "PhoneMirror already running",
+            "Another PhoneMirror window is already open.\n\n"
+            "Two copies will fight over the phone's camera and mirroring "
+            "will fail with 'Camera in use'.\n\n"
+            "Open the existing window instead?\n\n"
+            "(Yes = quit this new copy. No = run this copy anyway.)")
+        _probe.destroy()
+        if _ok:
+            sys.exit(0)
     app=PhoneMirror()
     app.mainloop()
