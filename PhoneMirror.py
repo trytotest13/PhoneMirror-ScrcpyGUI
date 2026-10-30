@@ -10,7 +10,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 APP_NAME = "PhoneMirror"
-APP_VERSION = "5.2"
+APP_VERSION = "5.4"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 ADB = os.path.join(ROOT, "adb.exe")
 SCRCPY = os.path.join(ROOT, "scrcpy.exe")
@@ -74,8 +74,11 @@ class PhoneMirror(tk.Tk):
         self.device_var = tk.StringVar(value="")   # selected device, drives a picker when >1 found
         self.advanced_widgets = {}        # name -> widget, so _scrcpy_args can read live values
         self.mic_enabled = tk.BooleanVar(value=True)    # separate Mic on/off toggle
+        self.audio_enabled = tk.BooleanVar(value=True)  # phone internal audio on/off toggle
         self.always_on_top = tk.BooleanVar(value=False) # overlay/on-top toggle
         self.toggle_buttons = {}          # quick-action toggle buttons, for state colouring
+        self.mic_proc = None              # audio-only scrcpy stream used when Audio+Mic are both on
+        self._mic_log_file = None
         self._monitor_job = None
         self._camera_wait_job = None      # pending restart waiting for camera release
         self._camera_retry_count = 0      # auto-retries for CAMERA_IN_USE restarts
@@ -252,6 +255,7 @@ class PhoneMirror(tk.Tk):
             ("⟳", "Rotate", self.rotate, PURPLE),
             ("☀", "Stay Awake", self.toggle_stay_awake, ORANGE),
             ("▰", "Open Folder", self.open_recordings, CYAN),
+            ("🔊", "Audio", self.toggle_audio, GREEN),
             ("🎤", "Mic", self.toggle_mic, ORANGE),
             ("📌", "On Top", self.toggle_always_on_top, BLUE),
         ]
@@ -599,22 +603,35 @@ class PhoneMirror(tk.Tk):
 
     def _scan_devices_worker(self):
         try:
-            subprocess.run([ADB,"start-server"],cwd=ROOT,capture_output=True,
-                           text=True,timeout=8,creationflags=win_flags())
-            self.adb_started_by_app=True
-            r=subprocess.run([ADB,"devices"],cwd=ROOT,capture_output=True,
+            r=subprocess.run([ADB,"start-server"],cwd=ROOT,capture_output=True,
                              text=True,timeout=8,creationflags=win_flags())
-            dev=[]
-            for line in r.stdout.splitlines()[1:]:
-                line=line.strip()
-                if not line:
-                    continue
-                parts=line.split("\t")
-                if len(parts)==2 and parts[1].strip()=="device":
-                    dev.append(parts[0].strip())
+            self.adb_started_by_app=True
+            # A freshly started daemon (first run, or after STOP ALL killed
+            # the previous one) needs a moment before the USB device shows
+            # up in `adb devices` — retry once instead of reporting "no
+            # device" while the phone is actually plugged in.
+            fresh = ("daemon" in (r.stdout or "") + (r.stderr or "")
+                     and "starting" in (r.stdout or "") + (r.stderr or ""))
+            dev=self._list_devices()
+            if not dev and fresh:
+                time.sleep(1.5)
+                dev=self._list_devices()
             self.after(0, self._apply_scan_result, dev, None)
         except Exception as e:
             self.after(0, self._apply_scan_result, [], str(e))
+
+    def _list_devices(self):
+        r=subprocess.run([ADB,"devices"],cwd=ROOT,capture_output=True,
+                         text=True,timeout=8,creationflags=win_flags())
+        dev=[]
+        for line in r.stdout.splitlines()[1:]:
+            line=line.strip()
+            if not line:
+                continue
+            parts=line.split("\t")
+            if len(parts)==2 and parts[1].strip()=="device":
+                dev.append(parts[0].strip())
+        return dev
 
     def _apply_scan_result(self, dev, error):
         if error:
@@ -703,9 +720,6 @@ class PhoneMirror(tk.Tk):
         self.set_status(f"{value} source selected")
 
         # A scrcpy process cannot change video-source/camera-facing after it
-        # has started. Restart it automatically so the button actually takes
-        # effect instead of requiring the user to stop/start manually.
-        # A scrcpy process cannot change video-source/camera-facing after it
         # has started. Restart it automatically so the change takes effect;
         # camera targets wait for Android to release the camera first
         # (see _restart_mirroring).
@@ -774,12 +788,8 @@ class PhoneMirror(tk.Tk):
             # Camera mode: let Android choose its supported default size/FPS.
             # Do NOT force --camera-fps=30; a few devices advertise different
             # camera profiles and reject an explicitly requested rate.
-            # Camera mirroring automatically uses the microphone unless audio
-            # is explicitly disabled.
-            if self.advanced_widgets.get("enable_audio_var") and not self.advanced_widgets["enable_audio_var"].get():
-                args += ["--no-audio"]
-            else:
-                args += ["--audio-source=mic"]
+            # Audio source/flags are decided once by the final Audio/Mic
+            # toggle block below, so nothing audio-related is added here.
 
             # Only apply options that are safe and independent of display
             # capture. These are intentionally not copied from the normal
@@ -870,19 +880,25 @@ class PhoneMirror(tk.Tk):
             if not self.keep_screen_on.get():
                 pass
 
-        # Separate Mic toggle (quick action). Applied last so it overrides
-        # any audio decisions made above: OFF forces silence, ON forces the
-        # microphone as the audio source.
-        if not self.mic_enabled.get():
-            args = self._strip_arg(args, "--audio-source")
-            if "--no-audio" not in args:
-                args += ["--no-audio"]
-        else:
+        # Final audio resolution — applied last so it overrides every audio
+        # decision made above. The Audio and Mic quick toggles are fully
+        # independent: scrcpy carries one audio source per process, so when
+        # both are enabled the main stream forwards the phone's internal
+        # audio and the microphone runs as a separate audio-only instance
+        # (spawned by start_mirroring).
+        args = self._strip_arg(args, "--audio-source")
+        if self.audio_enabled.get():
             if "--no-audio" in args:
                 args.remove("--no-audio")
-            if not any(a == "--audio-source" or a.startswith("--audio-source=")
-                       for a in args):
-                args += ["--audio-source", "mic"]
+            # "output" forwards the phone's internal sound to the PC
+            # (requires Android 11+).
+            args += ["--audio-source", "output"]
+        elif self.mic_enabled.get():
+            if "--no-audio" in args:
+                args.remove("--no-audio")
+            args += ["--audio-source", "mic"]
+        elif "--no-audio" not in args:
+            args += ["--no-audio"]
 
         # Always-on-top quick toggle. Skip if the Advanced tab already set it.
         if self.always_on_top.get() and "--always-on-top" not in args:
@@ -903,16 +919,114 @@ class PhoneMirror(tk.Tk):
         return args
 
     def start_mirroring(self):
-        if not self.selected_device:
-            self.scan_devices()
-        if not self.selected_device:
-            messagebox.showwarning("No device", "Connect an Android device first.")
-            return
         if self.scrcpy_proc and self.scrcpy_proc.poll() is None:
+            return
+        if getattr(self, "_starting", False):
             return
         if not os.path.exists(SCRCPY):
             messagebox.showerror("scrcpy missing","Place scrcpy.exe beside PhoneMirror.py.")
             return
+        if not os.path.exists(ADB):
+            messagebox.showerror("ADB missing","Place adb.exe beside PhoneMirror.py.")
+            return
+        # Never launch scrcpy on a stale selection: if the ADB server is not
+        # running, scrcpy starts its own daemon and races its first device
+        # enumeration, dying with "Could not find any ADB device". Verify the
+        # device is actually visible first (background thread — adb calls
+        # must not block the UI).
+        self._starting = True
+        self.set_status("Checking device…")
+        threading.Thread(target=self._start_precheck_worker, daemon=True).start()
+
+    def _adb_device_state(self, serial):
+        """Return (serial, state) for the requested device, or the first
+        usable one when serial is None. state is 'device', 'unauthorized',
+        'offline', or None when not listed."""
+        r=subprocess.run([ADB,"devices"],cwd=ROOT,capture_output=True,
+                         text=True,timeout=8,creationflags=win_flags())
+        entries=[]
+        for line in r.stdout.splitlines()[1:]:
+            line=line.strip()
+            if not line:
+                continue
+            parts=line.split("\t")
+            if len(parts)==2:
+                entries.append((parts[0].strip(), parts[1].strip()))
+        if serial:
+            for s,st in entries:
+                if s==serial:
+                    return s,st
+            return None,None
+        for s,st in entries:
+            if st=="device":
+                return s,st
+        return None,None
+
+    def _start_precheck_worker(self):
+        chosen=self.selected_device
+        try:
+            r=subprocess.run([ADB,"start-server"],cwd=ROOT,capture_output=True,
+                             text=True,timeout=8,creationflags=win_flags())
+            self.adb_started_by_app=True
+        except Exception:
+            r=None
+        # A freshly started daemon takes a moment to enumerate USB devices,
+        # so poll for a few seconds instead of failing on the first empty list.
+        state=None
+        deadline=time.time()+6.0
+        while time.time()<deadline:
+            try:
+                chosen,state=self._adb_device_state(self.selected_device)
+            except Exception as e:
+                self.after(0,self._start_precheck_failed,"adb",str(e))
+                return
+            if state=="device":
+                break
+            time.sleep(1.0)
+        if state=="device":
+            self.after(0,self._launch_scrcpy,chosen)
+            return
+        if state=="unauthorized":
+            self.after(0,self._start_precheck_failed,"unauthorized",chosen)
+        elif state=="offline":
+            self.after(0,self._start_precheck_failed,"offline",chosen)
+        else:
+            self.after(0,self._start_precheck_failed,"missing",self.selected_device)
+
+    def _start_precheck_failed(self,kind,detail):
+        self._starting=False
+        if kind=="unauthorized":
+            self.set_status("Device not authorized")
+            messagebox.showwarning(
+                "Device not authorized",
+                "The phone is connected but USB debugging is not authorized.\n\n"
+                "Unlock the phone and tap 'Allow' on the 'Allow USB debugging?' "
+                "prompt, then press START MIRRORING again.")
+        elif kind=="offline":
+            self.set_status("Device offline")
+            messagebox.showwarning(
+                "Device offline",
+                f"The device {detail} is listed as 'offline'.\n\n"
+                "Reconnect the USB cable (or re-run the Wi-Fi connect), then "
+                "press START MIRRORING again.")
+        elif kind=="adb":
+            self.set_status("ADB error")
+            messagebox.showerror("ADB error", str(detail))
+        else:
+            self.set_status("Waiting for device")
+            messagebox.showwarning(
+                "No device",
+                "No ADB device is visible.\n\n"
+                "- Connect the phone by USB and enable USB debugging\n"
+                "- If the phone was already plugged in, unplug and replug it\n"
+                "- For Wi-Fi, run the Wi-Fi connect step again\n\n"
+                "Then press START MIRRORING again.")
+
+    def _launch_scrcpy(self, chosen):
+        """Launch the verified mirroring session for device `chosen`."""
+        self._starting=False
+        self.selected_device=chosen
+        self.device_label.config(text=chosen)
         try:
             os.makedirs(self.record_path.get(),exist_ok=True)
             log_path = os.path.join(ROOT, "scrcpy-error.log")
@@ -923,6 +1037,7 @@ class PhoneMirror(tk.Tk):
             self._scrcpy_log_file = log_file
             self.scrcpy_proc=p
             self.owned_pids.add(p.pid)
+            self._start_mic_stream()
             self.start_btn.config(state="disabled",bg="#155C3A")
             self.stop_btn.config(state="normal",bg="#6E2028",fg="#FFDDE0")
             label = "Recording" if self.record_next_launch else "Mirroring"
@@ -943,11 +1058,58 @@ class PhoneMirror(tk.Tk):
         self._kill_process_tree(pid)
         self.owned_pids.discard(pid)
         self.scrcpy_proc=None
+        self._stop_mic_stream()
         self.start_btn.config(state="normal",bg=GREEN)
         self.stop_btn.config(state="disabled",bg=CARD_2,fg=MUTED)
         self.main_status.config(text="STATUS:  Ready",fg=TEXT)
         self.stat_details.config(text="Click START MIRRORING to begin")
         self.set_status("Stopped")
+
+    # ---------- independent mic audio stream ----------
+    # scrcpy carries exactly one audio source per process. When the Audio and
+    # Mic toggles are both enabled, the main instance forwards the phone's
+    # internal audio, and the microphone runs here as a second, headless
+    # scrcpy instance (--no-video --no-window) that just plays mic audio on
+    # the PC. The two are managed independently: toggling either one never
+    # disturbs the other's stream.
+    def _mic_stream_running(self):
+        return self.mic_proc is not None and self.mic_proc.poll() is None
+
+    def _start_mic_stream(self):
+        self._stop_mic_stream()
+        if not (self.audio_enabled.get() and self.mic_enabled.get()):
+            return
+        if not self.selected_device:
+            return
+        try:
+            log_path = os.path.join(ROOT, "mic-error.log")
+            self._mic_log_file = open(log_path, "w", encoding="utf-8",
+                                      errors="replace")
+            p = subprocess.Popen(
+                [SCRCPY, "-s", self.selected_device,
+                 "--no-video", "--no-window", "--no-control",
+                 "--audio-source=mic"],
+                cwd=ROOT, stdout=self._mic_log_file, stderr=self._mic_log_file,
+                creationflags=win_flags())
+            self.mic_proc = p
+            self.owned_pids.add(p.pid)
+        except Exception:
+            self._stop_mic_stream()
+            self.set_status("Mic audio stream failed to start")
+
+    def _stop_mic_stream(self):
+        if self.mic_proc is not None:
+            pid = self.mic_proc.pid
+            if self.mic_proc.poll() is None:
+                self._kill_process_tree(pid)
+            self.owned_pids.discard(pid)
+            self.mic_proc = None
+        if self._mic_log_file is not None:
+            try:
+                self._mic_log_file.close()
+            except Exception:
+                pass
+            self._mic_log_file = None
 
     # ---------- process liveness monitoring ----------
     # Previously nothing polled the scrcpy process. Closing the mirror
@@ -1034,10 +1196,24 @@ class PhoneMirror(tk.Tk):
             self._camera_wait_job = None
 
     def _check_process_alive(self):
+        # The mic side-stream lives independently of the main session: if it
+        # exits on its own just note it — mirroring itself is unaffected.
+        if self.mic_proc is not None and self.mic_proc.poll() is not None:
+            self.owned_pids.discard(self.mic_proc.pid)
+            self.mic_proc = None
+            if self._mic_log_file is not None:
+                try:
+                    self._mic_log_file.close()
+                except Exception:
+                    pass
+                self._mic_log_file = None
+            self.set_status("Mic audio stream ended")
+
         if self.scrcpy_proc is not None and self.scrcpy_proc.poll() is not None:
             # Process exited on its own (window closed, device unplugged, crash).
             self.owned_pids.discard(self.scrcpy_proc.pid)
             self.scrcpy_proc=None
+            self._stop_mic_stream()
 
             # If this launch died because Android hadn't released the camera
             # yet, retry the start automatically a couple of times instead of
@@ -1257,8 +1433,10 @@ class PhoneMirror(tk.Tk):
     # ---------- mic / always-on-top quick toggles ----------
     def _refresh_toggle_buttons(self):
         # Colour the toggle quick-actions green while they are enabled so the
-        # state is visible at a glance (Mic starts ON, On Top starts OFF).
-        states = {"Mic": self.mic_enabled.get(), "On Top": self.always_on_top.get()}
+        # state is visible at a glance (Audio/Mic start ON, On Top starts OFF).
+        states = {"Audio": self.audio_enabled.get(),
+                  "Mic": self.mic_enabled.get(),
+                  "On Top": self.always_on_top.get()}
         for name, on in states.items():
             b = self.toggle_buttons.get(name)
             if b is not None:
@@ -1273,19 +1451,55 @@ class PhoneMirror(tk.Tk):
         return [a for a in args if not a.startswith(flag + "=")]
 
     def toggle_mic(self):
-        """Turn the microphone audio capture on/off independently.
+        """Turn the microphone capture on/off, independent of everything else.
 
-        scrcpy cannot switch its audio source while running, so if a session
-        is live we restart it with the new setting.
+        With the Audio toggle also on, the mic runs as a separate audio-only
+        scrcpy instance and the main mirroring session is not touched. With
+        Audio off, the mic is the main session's audio source, so the session
+        restarts (scrcpy cannot switch audio source while running).
         """
         self.mic_enabled.set(not self.mic_enabled.get())
         self._refresh_toggle_buttons()
         on = self.mic_enabled.get()
-        self.set_status("Microphone " + ("ON — mic audio captured" if on
-                                         else "OFF — audio disabled"))
-        if self.scrcpy_proc is not None and self.scrcpy_proc.poll() is None:
+        if self.audio_enabled.get():
+            self.set_status("Microphone " + ("ON — mic streams separately"
+                                              if on
+                                              else "OFF — phone audio only"))
+        else:
+            self.set_status("Microphone " + ("ON — mic audio captured" if on
+                                             else "OFF — audio disabled"))
+        if self.scrcpy_proc is None or self.scrcpy_proc.poll() is not None:
+            return
+        if self.audio_enabled.get():
+            self._start_mic_stream()
+        else:
             self._restart_mirroring(
-                wait_camera=not self.mic_enabled.get())
+                wait_camera=self.source.get() in ("Back Camera", "Front Camera"))
+
+    def toggle_audio(self):
+        """Turn the phone's internal audio mirroring on/off, independent of
+        the source and of the Mic toggle."""
+        self.audio_enabled.set(not self.audio_enabled.get())
+        self._refresh_toggle_buttons()
+        on = self.audio_enabled.get()
+        if on:
+            self.set_status("Phone audio ON — internal audio mirrored"
+                            + (" (+ separate mic stream)"
+                               if self.mic_enabled.get() else ""))
+        else:
+            self.set_status("Phone audio OFF"
+                            + (" — mic only" if self.mic_enabled.get()
+                               else " — muted"))
+        if self.scrcpy_proc is None or self.scrcpy_proc.poll() is not None:
+            return
+        if on and self.mic_enabled.get():
+            # Main stream already forwards internal audio; just start the
+            # separate mic instance.
+            self._start_mic_stream()
+        else:
+            # The main session's audio source/flag changes — restart it.
+            self._restart_mirroring(
+                wait_camera=self.source.get() in ("Back Camera", "Front Camera"))
 
     def toggle_always_on_top(self):
         """Pin the scrcpy window above all other windows (overlay mode)."""
@@ -1372,6 +1586,7 @@ class PhoneMirror(tk.Tk):
 
         self.owned_pids.clear()
         self.scrcpy_proc=None
+        self._stop_mic_stream()
         self.start_btn.config(state="normal",bg=GREEN)
         self.stop_btn.config(state="disabled",bg=CARD_2,fg=MUTED)
         self.main_status.config(text="STATUS:  Ready",fg=TEXT)
@@ -1408,6 +1623,8 @@ class PhoneMirror(tk.Tk):
         except Exception:
             pass
         self.owned_pids.clear()
+        self.mic_proc = None
+        self._mic_log_file = None
 
         # 3. Kill the ADB server: this disconnects the phone, so any
         # device-side scrcpy server dies and the camera is released.

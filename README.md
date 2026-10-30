@@ -12,13 +12,22 @@ A simple Windows GUI for mirroring and controlling Android devices with scrcpy.
 - Emergency kill switch that only stops processes started by this app instance
 
 ### Quick-Action Toggles
-The QUICK ACTIONS panel includes two toggle buttons. Enabled toggles are highlighted green.
+The QUICK ACTIONS panel includes three toggle buttons. Enabled toggles are highlighted green.
 
+- **🔊 Audio** — Mirror the phone's internal audio (music, app sounds, game audio):
+  - ON: internal audio is forwarded to the PC (`--audio-source output`;
+    requires Android 11+); the phone's own speaker is muted while mirroring
+  - OFF: no internal audio
+  - Works with any source — screen, back camera, front camera. Fully
+    independent of the Mic toggle.
 - **🎤 Mic** — Turn microphone audio capture on/off independently:
-  - ON: the microphone is used as the audio source (`--audio-source mic`)
-  - OFF: all audio is disabled (`--no-audio`)
-  - scrcpy cannot change its audio source while running, so toggling Mic automatically
-    restarts an active mirroring session with the new setting.
+  - ON + Audio ON: the microphone streams through a second, audio-only
+    scrcpy process, so mic and phone audio play at the same time
+  - ON + Audio OFF: the microphone is the main audio source (`--audio-source mic`)
+  - OFF: no microphone
+  - scrcpy cannot change its audio source while running, so toggling Mic
+    with Audio off automatically restarts the session; with Audio on, the
+    main session is never disturbed.
 - **📌 On Top** — Overlay mode: pin the scrcpy window above all other windows:
   - While mirroring is running, the running window is pinned/unpinned immediately
     (no restart needed)
